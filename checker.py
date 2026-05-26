@@ -25,7 +25,7 @@ OUTPUT_FILE  = "sub.txt"
 # ── Ремарки ──────────────────────────────────
 # True  → оставляем оригинальные #fragment из конфигов
 # False → ставим свои: REMARK_PREFIX + порядковый номер
-USE_ORIGINAL_REMARKS = True
+USE_ORIGINAL_REMARKS = False
 REMARK_PREFIX        = "SkyVPN - "   # используется только если USE_ORIGINAL_REMARKS = False
 
 # ── Plain-subscription заголовки ─────────────
