@@ -3,17 +3,17 @@
 VPN Subscription Checker
 Reads sources.txt (vless:// or http(s):// links),
 fetches configs, checks TCP connectivity, outputs sub.txt
+with plain subscription headers (profile-title, announce, etc.)
 """
 
-import asyncio
 import base64
 import socket
 import urllib.request
-import urllib.error
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -22,19 +22,31 @@ import time
 SOURCES_FILE = "sources.txt"
 OUTPUT_FILE  = "sub.txt"
 
-# Если True — сохраняем оригинальные ремарки (#fragment) из конфигов
-# Если False — ставим свои ремарки: REMARK_PREFIX + порядковый номер
+# ── Ремарки ──────────────────────────────────
+# True  → оставляем оригинальные #fragment из конфигов
+# False → ставим свои: REMARK_PREFIX + порядковый номер
 USE_ORIGINAL_REMARKS = True
-REMARK_PREFIX        = "FreeVPN-"   # используется только если USE_ORIGINAL_REMARKS = False
+REMARK_PREFIX        = "SkyVPN-"   # используется только если USE_ORIGINAL_REMARKS = False
 
-# TCP-проверка: таймаут в секундах
-TCP_TIMEOUT  = 5
-# Максимум параллельных TCP-проверок
-MAX_WORKERS  = 100
+# ── Plain-subscription заголовки ─────────────
+# Отображаются в клиентах (Happ, v2rayNG, Streisand, Nekoray и т.д.)
+PROFILE_TITLE   = "SkyVPN"
+PROFILE_UPDATE  = 1800        # интервал обновления в секундах (30 мин = 1800)
 
-# Заголовок / баннер, добавляется первой строкой в sub.txt
-# Оставь пустой строкой "", чтобы не добавлять
-BANNER = f"# Updated: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} | Free VLESS configs"
+# Текст анонса — отображается внутри клиента под названием профиля.
+# {count}    → кол-во живых конфигов
+# {updated}  → время обновления UTC
+# {date}     → дата обновления UTC
+ANNOUNCE_TEMPLATE = (
+    "🚀 SkyVPN — бесплатный VPN без лимита трафика\n"
+    "⏰ Обновлено: {updated} UTC\n"
+    "✅ Живых серверов: {count}\n"
+    "♾ Трафик: безлимитный"
+)
+
+# ── TCP-проверка ──────────────────────────────
+TCP_TIMEOUT = 5
+MAX_WORKERS = 100
 
 
 # ─────────────────────────────────────────────
@@ -42,12 +54,11 @@ BANNER = f"# Updated: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} | Fre
 # ─────────────────────────────────────────────
 
 def fetch_url(url: str) -> str | None:
-    """Скачивает текст по URL, возвращает None при ошибке."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read()
-        # Пробуем base64-decode (формат большинства подписок)
+        # Пробуем base64-decode (большинство подписок так упакованы)
         try:
             decoded = base64.b64decode(raw + b"==").decode("utf-8", errors="ignore")
             if decoded.startswith(("vless://", "vmess://", "ss://", "trojan://", "hy2://", "hysteria2://")):
@@ -60,18 +71,13 @@ def fetch_url(url: str) -> str | None:
         return None
 
 
-def parse_vless_host_port(uri: str) -> tuple[str, int] | None:
-    """Извлекает (host, port) из vless:// URI."""
+def parse_host_port(uri: str) -> tuple[str, int] | None:
     try:
-        # vless://uuid@host:port?...#remark
-        without_scheme = uri[len("vless://"):]
+        without_scheme = uri.split("://", 1)[1]
         at_idx = without_scheme.rfind("@")
         if at_idx == -1:
             return None
-        host_part = without_scheme[at_idx + 1:]
-        # убираем query и fragment
-        host_part = re.split(r"[?#]", host_part)[0]
-        # host:port  или  [ipv6]:port
+        host_part = re.split(r"[?#]", without_scheme[at_idx + 1:])[0]
         if host_part.startswith("["):
             m = re.match(r"\[([^\]]+)\]:(\d+)", host_part)
         else:
@@ -84,7 +90,6 @@ def parse_vless_host_port(uri: str) -> tuple[str, int] | None:
 
 
 def tcp_check(host: str, port: int) -> bool:
-    """Синхронная TCP-проверка доступности."""
     try:
         with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
             return True
@@ -93,26 +98,50 @@ def tcp_check(host: str, port: int) -> bool:
 
 
 def set_remark(uri: str, remark: str) -> str:
-    """Заменяет или добавляет #remark в URI."""
     uri = re.sub(r"#.*$", "", uri.rstrip())
     return f"{uri}#{remark}"
 
 
 def get_remark(uri: str) -> str | None:
-    """Возвращает текущую ремарку из URI или None."""
     m = re.search(r"#(.+)$", uri)
-    if m:
-        return unquote(m.group(1))
-    return None
+    return unquote(m.group(1)) if m else None
 
 
-def collect_vless_uris(text: str) -> list[str]:
-    """Извлекает все vless:// URI из текста."""
-    return re.findall(r"vless://[^\s]+", text)
+def collect_uris(text: str) -> list[str]:
+    return re.findall(r"(?:vless|vmess|ss|trojan|hy2|hysteria2)://[^\s]+", text)
 
 
 # ─────────────────────────────────────────────
-#  MAIN
+#  PLAIN SUBSCRIPTION HEADER BUILDER
+# ─────────────────────────────────────────────
+
+def build_plain_header(count: int, updated: str) -> str:
+    """
+    Формат plain-subscription заголовков.
+    Клиенты читают строки вида:  # key: value
+    Поддерживается: Happ, v2rayNG ≥1.8, Streisand, Nekoray, Karing и др.
+
+    announce кодируется в base64 одной строкой, чтобы поддержать многострочный текст.
+    """
+    announce_text = ANNOUNCE_TEMPLATE.format(
+        count=count,
+        updated=updated,
+        date=updated.split()[0],
+    )
+    announce_b64 = base64.b64encode(announce_text.encode("utf-8")).decode("ascii")
+
+    return (
+        f"# profile-title: {PROFILE_TITLE}\n"
+        f"# profile-update-interval: {PROFILE_UPDATE}\n"
+        f"# subscription-userinfo: upload=0; download=0; total=0; expire=0\n"
+        f"# announce: base64:{announce_b64}\n"
+        f"# generated: {updated} UTC\n"
+        f"# total-count: {count}\n"
+    )
+
+
+# ─────────────────────────────────────────────
+#  PIPELINE
 # ─────────────────────────────────────────────
 
 def load_sources(path: str) -> list[str]:
@@ -131,44 +160,48 @@ def load_sources(path: str) -> list[str]:
 def gather_all_uris(sources: list[str]) -> list[str]:
     all_uris: list[str] = []
     for src in sources:
-        if src.startswith("vless://"):
+        if "://" in src and not src.startswith("http"):
             all_uris.append(src)
         elif src.startswith("http://") or src.startswith("https://"):
-            print(f"  → Загружаем подписку: {src}")
+            print(f"  → Подписка: {src}")
             text = fetch_url(src)
             if text:
-                found = collect_vless_uris(text)
-                print(f"    Найдено vless-конфигов: {len(found)}")
+                found = collect_uris(text)
+                print(f"    Найдено конфигов: {len(found)}")
                 all_uris.extend(found)
         else:
-            print(f"  [?] Неизвестный формат источника: {src}", file=sys.stderr)
+            print(f"  [?] Неизвестный источник: {src}", file=sys.stderr)
     return all_uris
 
 
-def check_all(uris: list[str]) -> list[str]:
-    """Параллельная TCP-проверка через ThreadPoolExecutor."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+def deduplicate(uris: list[str]) -> list[str]:
+    seen, result = set(), []
+    for uri in uris:
+        key = re.sub(r"#.*$", "", uri.strip())
+        if key not in seen:
+            seen.add(key)
+            result.append(uri)
+    return result
 
+
+def check_all(uris: list[str]) -> list[str]:
     valid: list[str] = []
     tasks: dict = {}
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         for uri in uris:
-            hp = parse_vless_host_port(uri)
+            hp = parse_host_port(uri)
             if hp is None:
                 continue
-            future = pool.submit(tcp_check, hp[0], hp[1])
-            tasks[future] = uri
+            tasks[pool.submit(tcp_check, hp[0], hp[1])] = uri
 
-        done = 0
-        total = len(tasks)
+        done, total = 0, len(tasks)
         for future in as_completed(tasks):
             done += 1
             uri = tasks[future]
-            ok = future.result()
-            hp = parse_vless_host_port(uri)
-            status = "✓" if ok else "✗"
-            print(f"  [{done}/{total}] {status} {hp[0]}:{hp[1]}")
+            ok  = future.result()
+            hp  = parse_host_port(uri)
+            print(f"  [{'✓' if ok else '✗'}] [{done}/{total}] {hp[0]}:{hp[1]}")
             if ok:
                 valid.append(uri)
 
@@ -179,52 +212,47 @@ def apply_remarks(uris: list[str]) -> list[str]:
     result = []
     for i, uri in enumerate(uris, start=1):
         if USE_ORIGINAL_REMARKS:
-            remark = get_remark(uri)
-            if not remark:
-                remark = f"{REMARK_PREFIX}{i}"
+            remark = get_remark(uri) or f"{REMARK_PREFIX}{i}"
             result.append(set_remark(uri, remark))
         else:
             result.append(set_remark(uri, f"{REMARK_PREFIX}{i}"))
     return result
 
 
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
+
 def main():
-    print("=" * 50)
-    print("  VPN Subscription Checker")
-    print("=" * 50)
+    print("=" * 52)
+    print("  SkyVPN — Subscription Builder")
+    print("=" * 52)
 
     sources = load_sources(SOURCES_FILE)
     if not sources:
-        print("[!] Нет источников для проверки. Добавь ссылки в sources.txt")
+        print("[!] sources.txt пуст. Добавь ссылки на подписки.")
         return
 
     print(f"\n[1/3] Источников: {len(sources)}. Собираем конфиги...")
-    all_uris = gather_all_uris(sources)
+    all_uris = deduplicate(gather_all_uris(sources))
+    print(f"      Уникальных конфигов: {len(all_uris)}")
 
-    # Дедупликация по базовому URI (без ремарки)
-    seen = set()
-    deduped = []
-    for uri in all_uris:
-        key = re.sub(r"#.*$", "", uri.strip())
-        if key not in seen:
-            seen.add(key)
-            deduped.append(uri)
+    print(f"\n[2/3] TCP-проверка...")
+    valid = check_all(all_uris)
+    print(f"\n      Живых: {len(valid)} / {len(all_uris)}")
 
-    print(f"\n[2/3] Всего уникальных конфигов: {len(deduped)}. Проверяем TCP...")
-    valid = check_all(deduped)
-    print(f"\n  Живых конфигов: {len(valid)} / {len(deduped)}")
-
-    print(f"\n[3/3] Применяем ремарки и сохраняем в {OUTPUT_FILE}...")
-    final = apply_remarks(valid)
+    print(f"\n[3/3] Формируем {OUTPUT_FILE}...")
+    final   = apply_remarks(valid)
+    updated = time.strftime("%Y-%m-%d %H:%M", time.gmtime())
+    header  = build_plain_header(len(final), updated)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        if BANNER:
-            f.write(BANNER + "\n")
+        f.write(header)
         for uri in final:
             f.write(uri + "\n")
 
-    print(f"\n✓ Готово! Сохранено {len(final)} конфигов → {OUTPUT_FILE}")
-    print("=" * 50)
+    print(f"\n✓ Готово! {len(final)} серверов → {OUTPUT_FILE}")
+    print("=" * 52)
 
 
 if __name__ == "__main__":
