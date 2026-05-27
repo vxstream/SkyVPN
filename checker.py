@@ -58,18 +58,25 @@ def fetch_url(url: str) -> str | None:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read()
-        # Пробуем base64-decode (большинство подписок так упакованы)
+            
+        # Пробуем декодировать Base64
         try:
-            decoded = base64.b64decode(raw + b"==").decode("utf-8", errors="ignore")
-            if decoded.startswith(("vless://", "vmess://", "ss://", "trojan://", "hy2://", "hysteria2://")):
+            # Убираем возможные пробелы/переносы строк, которые могут сломать b64decode
+            clean_raw = raw.strip()
+            decoded = base64.b64decode(clean_raw + b"==").decode("utf-8", errors="ignore")
+            
+            # Проверяем, есть ли вообще хоть одна рабочая ссылка в декодированном тексте
+            protocols = ("vless://", "vmess://", "ss://", "trojan://", "hy2://", "hysteria2://")
+            if any(p in decoded for p in protocols):
                 return decoded
         except Exception:
             pass
+            
+        # Если это был обычный текст (не b64), просто декодируем его в utf-8
         return raw.decode("utf-8", errors="ignore")
     except Exception as e:
         print(f"  [!] Не удалось загрузить {url}: {e}", file=sys.stderr)
         return None
-
 
 def parse_host_port(uri: str) -> tuple[str, int] | None:
     try:
